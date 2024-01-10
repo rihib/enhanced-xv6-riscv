@@ -16,10 +16,12 @@
 #include "file.h"
 #include "fcntl.h"
 
+extern int mkdir_flag;
+extern uint64 mkdir_mtime;
+
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
-static int
-argfd(int n, int *pfd, struct file **pf)
+static int argfd(int n, int *pfd, struct file **pf)
 {
   int fd;
   struct file *f;
@@ -36,8 +38,7 @@ argfd(int n, int *pfd, struct file **pf)
 
 // Allocate a file descriptor for the given file.
 // Takes over file reference from caller on success.
-static int
-fdalloc(struct file *f)
+static int fdalloc(struct file *f)
 {
   int fd;
   struct proc *p = myproc();
@@ -53,8 +54,7 @@ fdalloc(struct file *f)
   return -1;
 }
 
-uint64
-sys_dup(void)
+uint64 sys_dup(void)
 {
   struct file *f;
   int fd;
@@ -67,8 +67,7 @@ sys_dup(void)
   return fd;
 }
 
-uint64
-sys_read(void)
+uint64 sys_read(void)
 {
   struct file *f;
   int n;
@@ -81,8 +80,7 @@ sys_read(void)
   return fileread(f, p, n);
 }
 
-uint64
-sys_write(void)
+uint64 sys_write(void)
 {
   struct file *f;
   int n;
@@ -96,8 +94,7 @@ sys_write(void)
   return filewrite(f, p, n);
 }
 
-uint64
-sys_close(void)
+uint64 sys_close(void)
 {
   int fd;
   struct file *f;
@@ -109,8 +106,7 @@ sys_close(void)
   return 0;
 }
 
-uint64
-sys_fstat(void)
+uint64 sys_fstat(void)
 {
   struct file *f;
   uint64 st; // user pointer to struct stat
@@ -122,8 +118,7 @@ sys_fstat(void)
 }
 
 // Create the path new as a link to the same inode as old.
-uint64
-sys_link(void)
+uint64 sys_link(void)
 {
   char name[DIRSIZ], new[MAXPATH], old[MAXPATH];
   struct inode *dp, *ip;
@@ -150,7 +145,7 @@ sys_link(void)
   iupdate(ip);
   iunlock(ip);
 
-  if ((dp = nameiparent(new, name)) == 0)
+  if ((dp = nameiparent(new, name, 0)) == 0)
     goto bad;
   ilock(dp);
   if (dp->dev != ip->dev || dirlink(dp, name, ip->inum) < 0)
@@ -175,8 +170,7 @@ bad:
 }
 
 // Is the directory dp empty except for "." and ".." ?
-static int
-isdirempty(struct inode *dp)
+static int isdirempty(struct inode *dp)
 {
   int off;
   struct dirent de;
@@ -191,8 +185,7 @@ isdirempty(struct inode *dp)
   return 1;
 }
 
-uint64
-sys_unlink(void)
+uint64 sys_unlink(void)
 {
   struct inode *ip, *dp;
   struct dirent de;
@@ -203,7 +196,7 @@ sys_unlink(void)
     return -1;
 
   begin_op();
-  if ((dp = nameiparent(path, name)) == 0)
+  if ((dp = nameiparent(path, name, 0)) == 0)
   {
     end_op();
     return -1;
@@ -251,13 +244,50 @@ bad:
   return -1;
 }
 
-static struct inode *
-create(char *path, short type, short major, short minor)
+char *strcpy(char *, char *);
+extern struct fullpath_entity fullpath_index[100];
+
+// ディレクトリ作成後はそのフルパスとinodeをインデックスに登録するようにする
+// 登録時に衝突が起こった場合はpanicする必要があるが、今回は直接の親ディレクトリのinodeさえ取得できれば十分なので上書きする
+void register_fullpath_index(char *path, struct inode *ip)
+{
+  // hashを求める
+  // TODO: sumを求める際に先頭の/や末尾の/は無視するなどといった処理が抜けている
+  int sum = 0;
+  for (int i = 0; path[i] != '\0'; i++)
+  {
+    sum += path[i];
+  }
+  // なんらかの文字列はあるはずなので0のままはおかしい
+  if (sum == 0)
+  {
+    panic("register_fullpath_index: sum is 0");
+  }
+  int hash = sum % 100;
+  // fullpath_index[hash]にNULL以外が入っていたらpanic（今回は無効にする）
+  if (fullpath_index[hash].fullpath[0] != '\0')
+  {
+    printf("fullpath_index[hash].fullpath: %s\n",
+           fullpath_index[hash].fullpath);
+    panic("register_fullpath_index: fullpath is not empty");
+  }
+  if (fullpath_index[hash].ip != (void *)0)
+  {
+    panic("register_fullpath_index: ip is not empty");
+  }
+  // fullpath_index[hash]にフルパス（path）とinodeを登録する
+  strcpy(fullpath_index[hash].fullpath, path);
+  ip->type = T_DIR;
+  fullpath_index[hash].ip = ip;
+}
+
+static struct inode *create(char *path, short type, short major, short minor,
+                            int flag)
 {
   struct inode *ip, *dp;
   char name[DIRSIZ];
 
-  if ((dp = nameiparent(path, name)) == 0)
+  if ((dp = nameiparent(path, name, 1)) == 0)
     return 0;
 
   ilock(dp);
@@ -302,6 +332,8 @@ create(char *path, short type, short major, short minor)
   }
 
   iunlockput(dp);
+  // ディレクトリ作成後にフルパスとinodeを登録
+  register_fullpath_index(path, ip);
 
   return ip;
 
@@ -316,8 +348,7 @@ fail:
 
 int accesscheck(struct inode *ip, uint mode, char *path);
 
-uint64
-sys_open(void)
+uint64 sys_open(void)
 {
   char path[MAXPATH];
   int fd, omode;
@@ -333,7 +364,7 @@ sys_open(void)
 
   if (omode & O_CREATE)
   {
-    ip = create(path, T_FILE, 0, 0);
+    ip = create(path, T_FILE, 0, 0, 0);
     if (ip == 0)
     {
       end_op();
@@ -449,19 +480,18 @@ int accesscheck(struct inode *ip, uint mode, char *path)
   return 0;
 }
 
-uint getgid(uint uid)
-{
-  return uid;
-}
+uint getgid(uint uid) { return uid; }
 
-uint64
-sys_mkdir(void)
+#include "memlayout.h"
+
+uint64 sys_mkdir(void)
 {
   char path[MAXPATH];
   struct inode *ip;
 
   begin_op();
-  if (argstr(0, path, MAXPATH) < 0 || (ip = create(path, T_DIR, 0, 0)) == 0)
+  if (argstr(0, path, MAXPATH) < 0 ||
+      (ip = create(path, T_DIR, 0, 0, 1)) == 0)
   {
     end_op();
     return -1;
@@ -471,8 +501,7 @@ sys_mkdir(void)
   return 0;
 }
 
-uint64
-sys_mknod(void)
+uint64 sys_mknod(void)
 {
   struct inode *ip;
   char path[MAXPATH];
@@ -482,7 +511,7 @@ sys_mknod(void)
   argint(1, &major);
   argint(2, &minor);
   if ((argstr(0, path, MAXPATH)) < 0 ||
-      (ip = create(path, T_DEVICE, major, minor)) == 0)
+      (ip = create(path, T_DEVICE, major, minor, 0)) == 0)
   {
     end_op();
     return -1;
@@ -492,8 +521,7 @@ sys_mknod(void)
   return 0;
 }
 
-uint64
-sys_chdir(void)
+uint64 sys_chdir(void)
 {
   char path[MAXPATH];
   struct inode *ip;
@@ -519,8 +547,7 @@ sys_chdir(void)
   return 0;
 }
 
-uint64
-sys_exec(void)
+uint64 sys_exec(void)
 {
   char path[MAXPATH], *argv[MAXARG];
   int i;
@@ -567,8 +594,7 @@ bad:
   return -1;
 }
 
-uint64
-sys_pipe(void)
+uint64 sys_pipe(void)
 {
   uint64 fdarray; // user pointer to array of two integers
   struct file *rf, *wf;
@@ -588,7 +614,8 @@ sys_pipe(void)
     return -1;
   }
   if (copyout(p->pagetable, fdarray, (char *)&fd0, sizeof(fd0)) < 0 ||
-      copyout(p->pagetable, fdarray + sizeof(fd0), (char *)&fd1, sizeof(fd1)) < 0)
+      copyout(p->pagetable, fdarray + sizeof(fd0), (char *)&fd1, sizeof(fd1)) <
+          0)
   {
     p->ofile[fd0] = 0;
     p->ofile[fd1] = 0;
