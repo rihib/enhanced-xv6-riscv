@@ -10,6 +10,8 @@ Therefore, I have newly modified the file system to maintain the relationship be
 
 ## Add multiuser function
 
+A new permission function was also added to Xv6, making it a multi-user file system.
+
 It works as follows;
 
 ```
